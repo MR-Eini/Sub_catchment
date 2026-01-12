@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-Delineate subcatchments from:
-  1) LISFLOOD/PCRaster LDD (keypad codes 1..9, pit=5, nodata often 255)
-  2) Upstream area raster ALREADY IN km² (e.g., upstream_area_km2.tif you created)
+Adds export of each subcatchment as:
+  A) separate GeoTIFF per catchment (binary mask or ID values), OR
+  B) one multi-band GeoTIFF (each band = one catchment mask)
 
-Outputs:
-  - outlets (headwaters + confluences) as points
-  - subcatchment raster (IDs)
-  - subcatchment polygons
-
-Requirements:
-  pip install rasterio geopandas shapely whitebox
+Note: multi-band GeoTIFF can get huge if you have many catchments.
+Separate files are usually safer.
 """
 
 import os
 from pathlib import Path
 import numpy as np
 
-# Set BEFORE importing rasterio if you had GDAL warnings
 os.environ["GDAL_DATA"] = r"C:\Users\MRE\anaconda4\envs\Subcatchment\Library\share\gdal"
 os.environ["PROJ_LIB"]  = r"C:\Users\MRE\anaconda4\envs\Subcatchment\Library\share\proj"
 
@@ -28,25 +22,32 @@ import subprocess
 
 
 # --------------------------------------------------------------------
-#                 USER-DEFINED INPUTS (REPLACE THESE)
+# INPUTS
 # --------------------------------------------------------------------
-LDD_PATH = r"E:\pythonProject\spu\SPU_LDD_0.tif"                 # LISFLOOD LDD raster (keypad codes)
-UAA_KM2_PATH = r"E:\pythonProject\spu\upstream_area_km2.tif"     # Upstream area raster (km²)
-THRESH_KM2 = 10                                                # river threshold in km²
+LDD_PATH = r"E:\pythonProject\spu\SPU_LDD_0.tif"
+UAA_KM2_PATH = r"E:\pythonProject\spu\upstream_area_km2.tif"
+THRESH_KM2 = 10
 
-OUTLETS_SHP = r"E:\pythonProject\spu\outlets.shp"                # output outlets
-SUBCATCH_RASTER = r"E:\pythonProject\spu\subcatch.tif"           # output subcatchment raster
-SUBCATCH_SHP = r"E:\pythonProject\spu\subcatch.shp"              # output polygons
+OUTLETS_SHP = r"E:\pythonProject\spu\outlets.shp"
+SUBCATCH_RASTER = r"E:\pythonProject\spu\subcatch.tif"
+SUBCATCH_SHP = r"E:\pythonProject\spu\subcatch.shp"
 
 WBT_EXE = r"C:\Users\MRE\anaconda4\envs\Subcatchment\Library\bin\whitebox_tools.exe"
-ESRI_PNTR_PATH = r"E:\pythonProject\spu\d8_esri_pointer.tif"     # will be created/overwritten
+ESRI_PNTR_PATH = r"E:\pythonProject\spu\d8_esri_pointer.tif"
+
+# NEW: export options
+EXPORT_DIR = r"E:\pythonProject\spu\subcatch_tiffs"  # for separate files
+EXPORT_SEPARATE_TIFFS = True
+EXPORT_MULTIBAND_TIFF = False  # set True if you want a multi-band file
+MULTIBAND_TIFF_PATH = r"E:\pythonProject\spu\subcatch_multiband.tif"
+WRITE_MASKS_AS = "mask"  # "mask" (0/1) or "id" (id value, nodata elsewhere)
 # --------------------------------------------------------------------
 
 assert os.path.exists(WBT_EXE), f"whitebox_tools.exe not found: {WBT_EXE}"
 
-for p in [OUTLETS_SHP, SUBCATCH_RASTER, SUBCATCH_SHP, ESRI_PNTR_PATH]:
+for p in [OUTLETS_SHP, SUBCATCH_RASTER, SUBCATCH_SHP, ESRI_PNTR_PATH, MULTIBAND_TIFF_PATH]:
     Path(os.path.dirname(p)).mkdir(parents=True, exist_ok=True)
-
+Path(EXPORT_DIR).mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------
 # 1. Load UAA (km²) and LDD
@@ -63,7 +64,6 @@ with rasterio.open(LDD_PATH) as ds_ldd:
     ldd = ds_ldd.read(1)
     ldd_nodata = ds_ldd.nodata
 
-# Basic alignment checks (fail fast)
 if ldd.shape != uaa_km2.shape:
     raise RuntimeError(f"LDD shape {ldd.shape} != UAA shape {uaa_km2.shape}")
 if rasterio.open(LDD_PATH).transform != transform:
@@ -71,57 +71,35 @@ if rasterio.open(LDD_PATH).transform != transform:
 if rasterio.open(LDD_PATH).crs != uaa_crs:
     raise RuntimeError("LDD and UAA CRS differ")
 
-# Mask nodata in UAA
 uaa_mask = np.zeros(uaa_km2.shape, dtype=bool)
 if uaa_nodata is not None:
     uaa_mask |= (uaa_km2 == uaa_nodata)
 uaa_mask |= ~np.isfinite(uaa_km2)
 
-# -----------------------------------------------------------
-# 2. Extract river network (threshold) using UAA in km²
-# -----------------------------------------------------------
 river = (uaa_km2 >= THRESH_KM2) & (~uaa_mask)
 
 # -----------------------------------------------------------
-# 3. LISFLOOD/PCRaster LDD directions (keypad) + reverse check
+# 3–5. Find outlets (same as your script)
 # -----------------------------------------------------------
-# ldd code -> (dy, dx) DOWNSTREAM direction
 ldd_dirs = {
-    1: ( 1, -1),  # SW
-    2: ( 1,  0),  # S
-    3: ( 1,  1),  # SE
-    4: ( 0, -1),  # W
-    5: None,      # pit/outlet
-    6: ( 0,  1),  # E
-    7: (-1, -1),  # NW
-    8: (-1,  0),  # N
-    9: (-1,  1),  # NE
+    1: ( 1, -1), 2: ( 1,  0), 3: ( 1,  1),
+    4: ( 0, -1), 5: None,      6: ( 0,  1),
+    7: (-1, -1), 8: (-1,  0),  9: (-1,  1),
 }
-
-# For checking "does neighbor flow into current cell?"
-# We want: if neighbor has LDD code that points from neighbor to current.
 rev_code = {(dy, dx): code for code, v in ldd_dirs.items() if v is not None for (dy, dx) in [v]}
 
-# -----------------------------------------------------------
-# 4. Identify headwaters & confluences on the extracted river network
-#    IMPORTANT: only count upstream neighbors that are ALSO river cells
-# -----------------------------------------------------------
-outlet_points = []
-
-# Precompute valid-LDD mask to avoid None comparisons
 ldd_valid = np.isin(ldd, list(ldd_dirs.keys()))
 if ldd_nodata is not None:
     ldd_valid &= (ldd != ldd_nodata)
-ldd_valid &= (ldd != 255)  # common LISFLOOD nodata
+ldd_valid &= (ldd != 255)
 
+outlet_points = []
 for row in range(height):
     for col in range(width):
         if not river[row, col]:
             continue
 
         upstream_count = 0
-
-        # Check 8 neighbors
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):
                 if dy == 0 and dx == 0:
@@ -131,24 +109,18 @@ for row in range(height):
                 if not (0 <= r2 < height and 0 <= c2 < width):
                     continue
                 if not river[r2, c2]:
-                    continue  # only count tributaries within the stream network
+                    continue
                 if not ldd_valid[r2, c2]:
                     continue
 
-                # neighbor at (r2,c2) flows into (row,col) if its downstream step is (-dy,-dx)
                 needed_code = rev_code.get((-dy, -dx))
                 if needed_code is not None and ldd[r2, c2] == needed_code:
                     upstream_count += 1
 
-        # Headwater: no upstream river neighbor
-        # Confluence: 2+ upstream river neighbors
         if upstream_count == 0 or upstream_count >= 2:
             x, y = rasterio.transform.xy(transform, row, col)
             outlet_points.append(Point(x, y))
 
-# -----------------------------------------------------------
-# 5. Save outlet points as shapefile
-# -----------------------------------------------------------
 gdf = gpd.GeoDataFrame(
     {"id": np.arange(1, len(outlet_points) + 1, dtype=int)},
     geometry=outlet_points,
@@ -158,22 +130,12 @@ gdf.to_file(OUTLETS_SHP)
 print(f"Saved {len(outlet_points)} outlet points -> {OUTLETS_SHP}")
 
 # -----------------------------------------------------------
-# 6. Convert LISFLOOD LDD -> ESRI D8 pointer raster for Whitebox watershed
+# 6. Convert LISFLOOD LDD -> ESRI pointer
 # -----------------------------------------------------------
-LISFLOOD_TO_ESRI = {
-    1: 8,    # SW
-    2: 4,    # S
-    3: 2,    # SE
-    4: 16,   # W
-    5: 0,    # pit/outlet
-    6: 1,    # E
-    7: 32,   # NW
-    8: 64,   # N
-    9: 128,  # NE
-}
+LISFLOOD_TO_ESRI = {1: 8, 2: 4, 3: 2, 4: 16, 5: 0, 6: 1, 7: 32, 8: 64, 9: 128}
 PNTR_NODATA = np.uint16(65535)
-esri = np.zeros(ldd.shape, dtype=np.uint16)
 
+esri = np.zeros(ldd.shape, dtype=np.uint16)
 mask_ldd_nodata = np.zeros(ldd.shape, dtype=bool)
 if ldd_nodata is not None:
     mask_ldd_nodata |= (ldd == ldd_nodata)
@@ -181,7 +143,6 @@ mask_ldd_nodata |= (ldd == 255)
 
 for k, v in LISFLOOD_TO_ESRI.items():
     esri[ldd == k] = np.uint16(v)
-
 esri[mask_ldd_nodata] = PNTR_NODATA
 
 pntr_profile = profile.copy()
@@ -191,9 +152,8 @@ with rasterio.open(ESRI_PNTR_PATH, "w", **pntr_profile) as dst:
     dst.write(esri, 1)
 
 # -----------------------------------------------------------
-# 7. Run watershed delineation (WhiteboxTools CLI)
+# 7. Watershed delineation
 # -----------------------------------------------------------
-# Use CLI to avoid wrapper differences and ensure esri_pntr is used
 subprocess.run(
     [
         WBT_EXE,
@@ -209,7 +169,7 @@ subprocess.run(
 print(f"Subcatchment raster written to: {SUBCATCH_RASTER}")
 
 # -----------------------------------------------------------
-# 8. Convert raster -> polygons (WhiteboxTools CLI)
+# 8. Polygon export (optional)
 # -----------------------------------------------------------
 subprocess.run(
     [
@@ -222,3 +182,63 @@ subprocess.run(
     check=True
 )
 print(f"Subcatchment polygons written to: {SUBCATCH_SHP}")
+
+# -----------------------------------------------------------
+# 9. NEW: Export each subcatchment to separate TIFFs or one multiband TIFF
+# -----------------------------------------------------------
+with rasterio.open(SUBCATCH_RASTER) as ds:
+    sub = ds.read(1)
+    sub_profile = ds.profile.copy()
+    sub_nodata = ds.nodata
+
+# Collect unique IDs (exclude nodata/0)
+ids = np.unique(sub[np.isfinite(sub)])
+if sub_nodata is not None:
+    ids = ids[ids != sub_nodata]
+ids = ids[ids != 0]
+ids = ids.astype(int)
+
+print(f"Found {len(ids)} subcatchments (unique IDs).")
+
+# Output profile for masks
+out_profile = sub_profile.copy()
+out_profile.update(compress="lzw")
+
+if WRITE_MASKS_AS.lower() == "mask":
+    out_dtype = "uint8"
+    out_nodata = 0
+elif WRITE_MASKS_AS.lower() == "id":
+    out_dtype = sub_profile["dtype"]
+    out_nodata = sub_nodata if sub_nodata is not None else 0
+else:
+    raise ValueError("WRITE_MASKS_AS must be 'mask' or 'id'")
+
+# --- A) Separate files ---
+if EXPORT_SEPARATE_TIFFS:
+    sep_profile = out_profile.copy()
+    sep_profile.update(dtype=out_dtype, nodata=out_nodata, count=1)
+
+    for cid in ids:
+        out_path = os.path.join(EXPORT_DIR, f"subcatch_{cid:05d}.tif")
+
+        if WRITE_MASKS_AS.lower() == "mask":
+            arr = (sub == cid).astype(np.uint8)
+        else:
+            arr = np.where(sub == cid, sub.astype(sep_profile["dtype"]), out_nodata)
+
+        with rasterio.open(out_path, "w", **sep_profile) as dst:
+            dst.write(arr, 1)
+
+    print(f"Wrote {len(ids)} separate GeoTIFFs to: {EXPORT_DIR}")
+
+# --- B) One multiband file ---
+if EXPORT_MULTIBAND_TIFF:
+    # Warning: can be very large if many subcatchments
+    mb_profile = out_profile.copy()
+    mb_profile.update(dtype="uint8", nodata=0, count=len(ids))
+
+    with rasterio.open(MULTIBAND_TIFF_PATH, "w", **mb_profile) as dst:
+        for band_i, cid in enumerate(ids, start=1):
+            dst.write((sub == cid).astype(np.uint8), band_i)
+
+    print(f"Wrote multiband GeoTIFF: {MULTIBAND_TIFF_PATH} (bands={len(ids)})")
