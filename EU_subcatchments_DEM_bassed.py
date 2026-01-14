@@ -1,74 +1,103 @@
 #!/usr/bin/env python3
 """
-EU subcatchments from DEM (large raster-safe), analogous to your LDD/UAA workflow:
+EU subcatchments from a 90m DEM (ETRS89 / LAEA Europe, EPSG:3035), large-raster-safe.
 
-Steps:
-  1) Fill depressions (optional but recommended)
-  2) D8 pointer from DEM (ESRI-style powers of two)
-  3) D8 flow accumulation (cells) on full domain
-  4) Convert cells -> upstream area km² (constant cell area for projected CRS)
-  5) Stream mask: UAA_km2 >= THRESH_KM2
-  6) Pour points raster: headwaters (inflow=0) + confluences (inflow>=2) on stream network (blockwise)
-  7) Whitebox Watershed (pointer + pour raster) -> subcatch raster
-  8) Optional polygons
-  9) Export each catchment as cropped GeoTIFFs (streamed; avoids full reads)
+Your 90m DEM:
+  E:\pythonProject\Europe\PREP_90M\dem_90m_3035.tif
+  cellsize: 90 x 90 m
+  rows/cols: 48533 x 55548  (very large)
 
-Requirements:
-  pip install rasterio numpy
-  (optional) geopandas if you want point layers; not required here
-  WhiteboxTools CLI (whitebox_tools.exe)
+Workflow (WhiteboxTools + optional ArcGIS river burning):
+  0) (Optional) burn rivers into DEM using ArcGIS Pro (arcpy)
+  1) Fill depressions (Whitebox FillDepressions)
+  2) D8 pointer (Whitebox D8Pointer) -> ESRI pointer (powers of two)
+  3) D8 flow accumulation (cells) (Whitebox D8FlowAccumulation)
+  4) Convert cells -> upstream area (km²), constant cell area (90m*90m)
+  5) Stream mask: UAA_km2 >= THRESH_KM2 (default 1000 km²)
+  6) Pour points raster: headwaters + confluences on stream network (blockwise)
+  7) Watershed (Whitebox Watershed) -> subcatch raster
+  8) Export each catchment as cropped GeoTIFFs (streamed; safe tiling)
+
+Run in PyCharm with ArcGIS Pro Python if you want burning:
+  "C:\\Program Files\\ArcGIS\\Pro\\bin\\Python\\envs\\arcgispro-py3\\python.exe" script.py
+Otherwise set RIVERS=None and it runs without arcpy.
+
+Notes:
+- This is EU-scale; exports can be thousands of files.
+- Uses temp-write + rename to avoid partially-written TIFF issues.
+
+Fixes:
+- avoids writing projected rivers to .gpkg (ArcPy expects a feature class path)
+- uses FileGDB for projected rivers
+- uses OIDFieldName for PolylineToRaster value_field
+- removes EPSG:3035 strict check; only requires projected meters for km² conversion
 """
 
 import os
-import math
+import time
 from pathlib import Path
 import numpy as np
-
-# If you had GDAL warnings in conda, keep these
-os.environ["GDAL_DATA"] = r"C:\Users\MRE\anaconda4\envs\Subcatchment\Library\share\gdal"
-os.environ["PROJ_LIB"]  = r"C:\Users\MRE\anaconda4\envs\Subcatchment\Library\share\proj"
+import subprocess
 
 import rasterio
 from rasterio.windows import Window
-import subprocess
-
 
 # -------------------------
-# INPUTS
+# INPUTS (EDIT)
 # -------------------------
-OUT_DIR = r"Z:\EUData\download\Mamad\Europe\SubCatch_from_DTM30m\OUT_DEM90M_WHITEBOX"
+OUT_DIR = r"E:\pythonProject\Europe\OUT_DEM90M_WHITEBOX"
 Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 
-DEM_90M = r"Z:\EUData\download\Mamad\Europe\SubCatch_from_DTM30m\dem_90m_3035.tif"  # <-- your 90m DEM (create in ArcGIS if needed)
+DEM_90M = r"E:\pythonProject\Europe\PREP_90M\dem_90m_3035.tif"
 
-# Optional: use a pre-masked DEM (sea/lakes as NoData) if you have it
-DEM_MASKED = None  # e.g. r"...\dem_90m_land_only.tif"
+LAND_MASK = None  # optional aligned land mask raster (land=1, water=0), processed with ArcGIS if provided
 
-# Optional: use a pre-burned DEM (burn rivers in ArcGIS if needed)
-DEM_BURNED = None  # e.g. r"...\dem_90m_burned.tif"
+RIVERS = r"E:\pythonProject\spu\river.shp"  # set None to disable burning
+BURN_DEPTH_M = 10.0
+RIVER_BUFFER_CELLS = 1
 
-# WhiteboxTools
 WBT_EXE = r"C:\Users\MRE\anaconda4\envs\Subcatchment\Library\bin\whitebox_tools.exe"
 assert os.path.exists(WBT_EXE), f"whitebox_tools.exe not found: {WBT_EXE}"
 
-THRESH_KM2 = 1000.0  # stream definition threshold (like your LDD/UAA script)
+THRESH_KM2 = 1000.0  # stream definition threshold
 
 # Outputs / intermediates
+DEM_LAND     = os.path.join(OUT_DIR, "dem_land_only.tif")
+DEM_BURNED   = os.path.join(OUT_DIR, "dem_burned.tif")
 DEM_FILLED   = os.path.join(OUT_DIR, "dem_filled.tif")
 D8_PNTR      = os.path.join(OUT_DIR, "d8_pointer_esri.tif")
 UP_CELLS     = os.path.join(OUT_DIR, "upstream_cells.tif")
 UAA_KM2      = os.path.join(OUT_DIR, "upstream_area_km2.tif")
 POUR_RASTER  = os.path.join(OUT_DIR, "pour_pts.tif")
-
 SUBCATCH_RASTER = os.path.join(OUT_DIR, "subcatch.tif")
-SUBCATCH_GPKG   = os.path.join(OUT_DIR, "subcatch.gpkg")   # optional polygons
-SUBCATCH_LAYER  = "subcatch"
 
 EXPORT_DIR = os.path.join(OUT_DIR, "subcatch_tiffs")
 EXPORT_SEPARATE_TIFFS = True
-WRITE_MASKS_AS = "mask"     # "mask" (0/1) or "id" (id elsewhere nodata)
-MAX_EXPORT = None           # set e.g. 200 for testing
+WRITE_MASKS_AS = "mask"   # "mask" (0/1) or "id"
+MAX_EXPORT = None         # e.g. 200 for testing
 # -------------------------
+
+
+# -------------------------
+# Timing helpers
+# -------------------------
+class Timer:
+    def __init__(self):
+        self.t0 = time.perf_counter()
+        self.marks = []
+
+    def mark(self, label: str):
+        t = time.perf_counter()
+        self.marks.append((label, t - self.t0))
+
+    def summary(self):
+        if not self.marks:
+            return
+        print("\n--- Timing summary ---")
+        prev = 0.0
+        for lbl, tsec in self.marks:
+            print(f"{lbl:<28} {tsec/60:.2f} min  (Δ {(tsec-prev)/60:.2f} min)")
+            prev = tsec
 
 
 def run_wbt(args, wd):
@@ -94,10 +123,7 @@ def tile_dim(dim, preferred=512):
     return max(16, t)
 
 
-# ESRI D8 pointer codes:
-# 1=E, 2=SE, 4=S, 8=SW, 16=W, 32=NW, 64=N, 128=NE
-# For neighbor at (ndy, ndx) relative to current, to flow into current,
-# neighbor must point (-ndy, -ndx):
+# ESRI D8 pointer codes
 STEP_TO_CODE = {
     ( 0,  1): 1,    # E
     ( 1,  1): 2,    # SE
@@ -115,19 +141,121 @@ def expand_window(win: Window, pad: int, h: int, w: int) -> Window:
     c0 = max(0, win.col_off - pad)
     r1 = min(h, win.row_off + win.height + pad)
     c1 = min(w, win.col_off + win.width + pad)
-    return Window(c0, r0, c1 - c0, r1 - r0)  # note: Window(col_off, row_off,...)
+    return Window(c0, r0, c1 - c0, r1 - r0)
+
+
+def ensure_filegdb(gdb_path: str):
+    import arcpy
+    folder = os.path.dirname(gdb_path)
+    name = os.path.basename(gdb_path)
+    if not arcpy.Exists(gdb_path):
+        arcpy.management.CreateFileGDB(folder, name)
+
+
+def burn_rivers_into_dem_arcpy(dem_path, rivers_fc, out_dem, burn_depth_m=10.0, buffer_cells=1):
+    """
+    Burn rivers into DEM using ArcGIS:
+      - project rivers to DEM CRS into a FileGDB feature class
+      - polyline->raster aligned to DEM
+      - optional Expand to widen channel
+      - subtract burn depth where river raster is 1
+    """
+    import arcpy
+    from arcpy.sa import Raster, Con, IsNull, Expand
+
+    arcpy.CheckOutExtension("Spatial")
+    arcpy.env.overwriteOutput = True
+    arcpy.env.snapRaster = dem_path
+    arcpy.env.cellSize = dem_path
+    arcpy.env.extent = dem_path
+    arcpy.env.workspace = OUT_DIR
+
+    scratch_gdb = os.path.join(OUT_DIR, "_scratch.gdb")
+    ensure_filegdb(scratch_gdb)
+
+    if not arcpy.Exists(rivers_fc):
+        raise FileNotFoundError(f"RIVERS not found: {rivers_fc}")
+
+    dem_sr = arcpy.Describe(dem_path).spatialReference
+    riv_sr = arcpy.Describe(rivers_fc).spatialReference
+
+    rivers_use = rivers_fc
+    rivers_proj_fc = os.path.join(scratch_gdb, "rivers_proj")
+
+    # Reproject if needed (or just overwrite projected fc)
+    if arcpy.Exists(rivers_proj_fc):
+        arcpy.management.Delete(rivers_proj_fc)
+
+    if riv_sr and dem_sr and (riv_sr.factoryCode != dem_sr.factoryCode or riv_sr.name != dem_sr.name):
+        arcpy.management.Project(rivers_fc, rivers_proj_fc, dem_sr)
+        rivers_use = rivers_proj_fc
+    else:
+        # still copy into gdb to guarantee support
+        arcpy.management.CopyFeatures(rivers_fc, rivers_proj_fc)
+        rivers_use = rivers_proj_fc
+
+    oid_field = arcpy.Describe(rivers_use).OIDFieldName
+
+    dem = Raster(dem_path)
+    rivers_ras = os.path.join(OUT_DIR, "rivers_ras.tif")
+    if arcpy.Exists(rivers_ras):
+        arcpy.management.Delete(rivers_ras)
+
+    arcpy.conversion.PolylineToRaster(
+        in_features=rivers_use,
+        value_field=oid_field,
+        out_rasterdataset=rivers_ras,
+        cell_assignment="MAXIMUM_LENGTH",
+        priority_field="NONE",
+        cellsize=dem.meanCellWidth
+    )
+
+    r = Raster(rivers_ras)
+    r01 = Con(IsNull(r), 0, 1)
+
+    if buffer_cells and int(buffer_cells) > 0:
+        r01 = Expand(r01, int(buffer_cells), [1])
+
+    burned = dem - (r01 * float(burn_depth_m))
+
+    # Safe overwrite
+    if os.path.exists(out_dem):
+        try:
+            os.remove(out_dem)
+        except OSError:
+            pass
+    burned.save(out_dem)
+    return out_dem
+
+
+def apply_land_mask_arcpy(dem_path, land_mask_path, out_dem_path):
+    import arcpy
+    from arcpy.sa import Raster, SetNull
+
+    arcpy.CheckOutExtension("Spatial")
+    arcpy.env.overwriteOutput = True
+    arcpy.env.snapRaster = dem_path
+    arcpy.env.cellSize = dem_path
+    arcpy.env.extent = dem_path
+    arcpy.env.workspace = OUT_DIR
+
+    if not arcpy.Exists(land_mask_path):
+        raise FileNotFoundError(f"LAND_MASK not found: {land_mask_path}")
+
+    dem = Raster(dem_path)
+    land = Raster(land_mask_path)
+    dem_land = SetNull(land == 0, dem)
+
+    if os.path.exists(out_dem_path):
+        try:
+            os.remove(out_dem_path)
+        except OSError:
+            pass
+    dem_land.save(out_dem_path)
+    return out_dem_path
 
 
 def compute_pour_raster_blockwise(pntr_tif: str, uaa_km2_tif: str, out_pour_tif: str, thresh_km2: float):
-    """
-    Build pour-point raster (int32) in one pass:
-      - stream = (UAA >= thresh)
-      - inflow count computed from ESRI pointer + stream in a 1-cell halo
-      - pour points = stream & (inflow==0 or inflow>=2)
-      - assign sequential IDs to pour pixels
-
-    Writes out_pour_tif with nodata=0 and values 1..N.
-    """
     print("Building pour-point raster (blockwise)...")
 
     with rasterio.open(pntr_tif) as pntr_ds, rasterio.open(uaa_km2_tif) as uaa_ds:
@@ -139,16 +267,8 @@ def compute_pour_raster_blockwise(pntr_tif: str, uaa_km2_tif: str, out_pour_tif:
         uaa_nd = uaa_ds.nodata
 
         prof = pntr_ds.profile.copy()
-        prof.update(
-            driver="GTiff",
-            dtype="int32",
-            count=1,
-            nodata=0,
-            compress="lzw",
-            BIGTIFF="IF_SAFER"
-        )
+        prof.update(driver="GTiff", dtype="int32", count=1, nodata=0, compress="lzw", BIGTIFF="IF_SAFER")
 
-        # safe tiling for large rasters
         bx = tile_dim(w)
         by = tile_dim(h)
         if bx is not None and by is not None:
@@ -158,7 +278,6 @@ def compute_pour_raster_blockwise(pntr_tif: str, uaa_km2_tif: str, out_pour_tif:
             prof.pop("blockxsize", None)
             prof.pop("blockysize", None)
 
-        # write temp then rename (prevents half-written TIFF issues)
         out_path = Path(out_pour_tif)
         tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
         if tmp_path.exists():
@@ -176,13 +295,11 @@ def compute_pour_raster_blockwise(pntr_tif: str, uaa_km2_tif: str, out_pour_tif:
                 pntr_big = pntr_ds.read(1, window=big)
                 uaa_big = uaa_ds.read(1, window=big)
 
-                # stream in big window
                 stream_big = np.isfinite(uaa_big)
                 if uaa_nd is not None:
                     stream_big &= (uaa_big != uaa_nd)
                 stream_big &= (uaa_big >= thresh_km2)
 
-                # pointer valid
                 pntr_valid_big = np.isfinite(pntr_big)
                 if pntr_nd is not None:
                     pntr_valid_big &= (pntr_big != pntr_nd)
@@ -190,7 +307,6 @@ def compute_pour_raster_blockwise(pntr_tif: str, uaa_km2_tif: str, out_pour_tif:
 
                 inflow_big = np.zeros(pntr_big.shape, dtype=np.uint8)
 
-                # compute inflow counts
                 for ndy in (-1, 0, 1):
                     for ndx in (-1, 0, 1):
                         if ndy == 0 and ndx == 0:
@@ -200,8 +316,6 @@ def compute_pour_raster_blockwise(pntr_tif: str, uaa_km2_tif: str, out_pour_tif:
                             continue
 
                         H, W = pntr_big.shape
-
-                        # dst indices where neighbor exists
                         r0 = max(0, -ndy)
                         r1 = H - max(0, ndy)
                         c0 = max(0, -ndx)
@@ -210,14 +324,9 @@ def compute_pour_raster_blockwise(pntr_tif: str, uaa_km2_tif: str, out_pour_tif:
                         dst = (slice(r0, r1), slice(c0, c1))
                         src = (slice(r0 + ndy, r1 + ndy), slice(c0 + ndx, c1 + ndx))
 
-                        nbr_ok = (
-                            stream_big[src]
-                            & pntr_valid_big[src]
-                            & (pntr_big[src] == needed_code)
-                        )
+                        nbr_ok = stream_big[src] & pntr_valid_big[src] & (pntr_big[src] == needed_code)
                         inflow_big[dst] += nbr_ok.astype(np.uint8)
 
-                # crop back to interior window (remove halo)
                 r_off = int(win.row_off - big.row_off)
                 c_off = int(win.col_off - big.col_off)
                 rr = slice(r_off, r_off + int(win.height))
@@ -225,7 +334,6 @@ def compute_pour_raster_blockwise(pntr_tif: str, uaa_km2_tif: str, out_pour_tif:
 
                 stream = stream_big[rr, cc]
                 inflow = inflow_big[rr, cc]
-
                 pour_mask = stream & ((inflow == 0) | (inflow >= 2))
 
                 block_out = np.zeros((int(win.height), int(win.width)), dtype=np.int32)
@@ -243,21 +351,14 @@ def compute_pour_raster_blockwise(pntr_tif: str, uaa_km2_tif: str, out_pour_tif:
 
 
 def export_catchments_cropped_streaming(subcatch_tif: str, export_dir: str, write_as="mask", max_export=None):
-    """
-    Streaming export:
-      Pass 1: scan blocks -> bounding boxes per catchment ID
-      Pass 2: write each catchment cropped to bbox as GeoTIFF
-    """
     Path(export_dir).mkdir(parents=True, exist_ok=True)
 
     with rasterio.open(subcatch_tif) as ds:
         nd = ds.nodata
-        h, w = ds.height, ds.width
         tfm0 = ds.transform
         prof0 = ds.profile.copy()
 
-        # Pass 1: bounding boxes
-        boxes = {}  # id -> [minr, maxr, minc, maxc]
+        boxes = {}
         for _, win in ds.block_windows(1):
             arr = ds.read(1, window=win)
 
@@ -292,7 +393,6 @@ def export_catchments_cropped_streaming(subcatch_tif: str, export_dir: str, writ
 
         print(f"Exporting {len(ids)} catchments to: {export_dir}")
 
-        # Output profile for each export
         if write_as.lower() == "mask":
             out_dtype = "uint8"
             out_nodata = 0
@@ -304,10 +404,7 @@ def export_catchments_cropped_streaming(subcatch_tif: str, export_dir: str, writ
 
         for i, cid in enumerate(ids, start=1):
             rmin, rmax, cmin, cmax = boxes[cid]
-            r0, r1 = rmin, rmax + 1
-            c0, c1 = cmin, cmax + 1
-
-            win = Window(c0, r0, c1 - c0, r1 - r0)
+            win = Window(cmin, rmin, (cmax - cmin + 1), (rmax - rmin + 1))
             arr = ds.read(1, window=win)
 
             if write_as.lower() == "mask":
@@ -350,7 +447,6 @@ def export_catchments_cropped_streaming(subcatch_tif: str, export_dir: str, writ
 
             with rasterio.open(tmp_path, "w", **out_prof) as out_ds:
                 out_ds.write(out_arr.astype(out_dtype), 1)
-
             tmp_path.replace(out_path)
 
             if i % 250 == 0:
@@ -362,66 +458,72 @@ def export_catchments_cropped_streaming(subcatch_tif: str, export_dir: str, writ
 # -------------------------
 # MAIN
 # -------------------------
-print("0) Choose DEM input...")
-dem_in = DEM_90M
-if DEM_MASKED:
-    dem_in = DEM_MASKED
-if DEM_BURNED:
-    dem_in = DEM_BURNED
-assert os.path.exists(dem_in), f"DEM not found: {dem_in}"
-print("DEM:", dem_in)
+T = Timer()
 
-print("1) Fill depressions (recommended)...")
-if not os.path.exists(DEM_FILLED):
-    run_wbt(
-        [
-            "--run=FillDepressions",
-            f"--dem={dem_in}",
-            f"--output={DEM_FILLED}",
-        ],
-        wd=OUT_DIR
+print("0) Checking DEM...")
+assert os.path.exists(DEM_90M), f"DEM not found: {DEM_90M}"
+
+with rasterio.open(DEM_90M) as ds:
+    print("DEM:", DEM_90M)
+    print("CRS:", ds.crs)
+    print("RES:", ds.res)
+    print("Rows/Cols:", ds.height, ds.width)
+    if ds.crs is None or not ds.crs.is_projected:
+        raise RuntimeError("DEM CRS must be projected (meters) for constant km² cell-area conversion.")
+T.mark("DEM check")
+
+dem_in = DEM_90M
+
+if LAND_MASK:
+    print("0b) Applying LAND_MASK (ArcGIS)...")
+    dem_in = apply_land_mask_arcpy(dem_in, LAND_MASK, DEM_LAND)
+    print("Masked DEM:", dem_in)
+    T.mark("Apply land mask")
+
+if RIVERS:
+    print("0c) Burning rivers into DEM (ArcGIS)...")
+    dem_in = burn_rivers_into_dem_arcpy(
+        dem_in, RIVERS, DEM_BURNED,
+        burn_depth_m=BURN_DEPTH_M,
+        buffer_cells=RIVER_BUFFER_CELLS
     )
+    print("Burned DEM:", dem_in)
+    T.mark("Burn rivers")
+
+print("1) Fill depressions...")
+if not os.path.exists(DEM_FILLED):
+    run_wbt(["--run=FillDepressions", f"--dem={dem_in}", f"--output={DEM_FILLED}"], wd=OUT_DIR)
 print("   Wrote:", DEM_FILLED)
+T.mark("Fill depressions")
 
 print("2) D8 pointer (ESRI) from DEM...")
 if not os.path.exists(D8_PNTR):
-    run_wbt(
-        [
-            "--run=D8Pointer",
-            f"--dem={DEM_FILLED}",
-            f"--output={D8_PNTR}",
-        ],
-        wd=OUT_DIR
-    )
+    run_wbt(["--run=D8Pointer", f"--dem={DEM_FILLED}", f"--output={D8_PNTR}"], wd=OUT_DIR)
 print("   Wrote:", D8_PNTR)
+T.mark("D8 pointer")
 
-print("3) Flow accumulation (cells) on FULL domain...")
+print("3) Flow accumulation (cells) on full domain...")
 if not os.path.exists(UP_CELLS):
     run_wbt(
-        [
-            "--run=D8FlowAccumulation",
-            f"--input={D8_PNTR}",
-            f"--output={UP_CELLS}",
-            "--out_type=cells",
-            "--pntr",
-            "--esri_pntr",
-        ],
+        ["--run=D8FlowAccumulation", f"--input={D8_PNTR}", f"--output={UP_CELLS}",
+         "--out_type=cells", "--pntr", "--esri_pntr"],
         wd=OUT_DIR
     )
 print("   Wrote:", UP_CELLS)
+T.mark("Flow accumulation")
 
-print("4) Convert upstream cells -> upstream area (km²) ...")
+print("4) Convert upstream cells -> upstream area (km²)...")
+with rasterio.open(D8_PNTR) as ds:
+    resx, resy = ds.res
+cell_km2 = (abs(resx) * abs(resy)) / 1e6
+print("   cell_km2 =", cell_km2)
+
 if not os.path.exists(UAA_KM2):
-    with rasterio.open(D8_PNTR) as ds_p:
-        resx, resy = ds_p.res
-        # projected CRS assumed (meters); constant cell area
-        cell_km2 = (abs(resx) * abs(resy)) / 1e6
-
     with rasterio.open(UP_CELLS) as ds:
         prof = ds.profile.copy()
         nd = ds.nodata
 
-        prof.update(driver="GTiff", dtype="float32", count=1, compress="lzw", BIGTIFF="IF_SAFER")
+        prof.update(driver="GTiff", dtype="float32", count=1, nodata=nd, compress="lzw", BIGTIFF="IF_SAFER")
 
         bx = tile_dim(ds.width)
         by = tile_dim(ds.height)
@@ -446,50 +548,30 @@ if not os.path.exists(UAA_KM2):
                 if nd is not None:
                     uaa[up == nd] = nd
                 out_ds.write(uaa.astype("float32"), 1, window=win)
-
         tmp_path.replace(out_path)
 
 print("   Wrote:", UAA_KM2)
+T.mark("Cells -> km²")
 
-print("5) Build pour points raster (headwaters + confluences) from UAA>=1000km² ...")
+print(f"5) Build pour points raster (UAA >= {THRESH_KM2} km²)...")
 if not os.path.exists(POUR_RASTER):
     compute_pour_raster_blockwise(D8_PNTR, UAA_KM2, POUR_RASTER, THRESH_KM2)
 print("   Wrote:", POUR_RASTER)
+T.mark("Pour points raster")
 
-print("6) Watershed (pointer + pour raster) -> subcatch raster ...")
+print("6) Watershed -> subcatch raster...")
 if not os.path.exists(SUBCATCH_RASTER):
     run_wbt(
-        [
-            "--run=Watershed",
-            f"--d8_pntr={D8_PNTR}",
-            f"--pour_pts={POUR_RASTER}",
-            f"--output={SUBCATCH_RASTER}",
-            "--esri_pntr",
-        ],
+        ["--run=Watershed", f"--d8_pntr={D8_PNTR}", f"--pour_pts={POUR_RASTER}", f"--output={SUBCATCH_RASTER}", "--esri_pntr"],
         wd=OUT_DIR
     )
 print("   Wrote:", SUBCATCH_RASTER)
+T.mark("Watershed")
 
-print("7) Raster -> polygons (optional; can be huge) ...")
-# Uncomment if needed
-# if not os.path.exists(SUBCATCH_GPKG):
-#     run_wbt(
-#         [
-#             "--run=RasterToVectorPolygons",
-#             f"--input={SUBCATCH_RASTER}",
-#             f"--output={SUBCATCH_GPKG}",
-#         ],
-#         wd=OUT_DIR
-#     )
-# print("   Wrote:", SUBCATCH_GPKG)
-
-print("8) Export each catchment as cropped GeoTIFFs ...")
+print("7) Export catchments (cropped GeoTIFFs)...")
 if EXPORT_SEPARATE_TIFFS:
-    export_catchments_cropped_streaming(
-        SUBCATCH_RASTER,
-        EXPORT_DIR,
-        write_as=WRITE_MASKS_AS,
-        max_export=MAX_EXPORT
-    )
+    export_catchments_cropped_streaming(SUBCATCH_RASTER, EXPORT_DIR, write_as=WRITE_MASKS_AS, max_export=MAX_EXPORT)
+T.mark("Export catchments")
 
 print("DONE.")
+T.summary()
