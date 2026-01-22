@@ -11,7 +11,7 @@ arcpy.env.overwriteOutput = True
 # -----------------------------
 # INPUTS
 # -----------------------------
-DEM_IN = r"E:\pythonProject\Europe\OUT_DEM90M_WHITEBOX\dem_burned.tif"  # use burned DEM if you have it
+DEM_IN = r"E:\pythonProject\Europe\PREP_90M\dem_burned.tif"  # use burned DEM if you have it
 # DEM_IN = r"E:\pythonProject\Europe\PREP_90M\dem_90m_3035.tif"        # or original 90m
 
 OUT_DIR = r"E:\pythonProject\Europe\OUT_ARCGIS_90M"
@@ -20,7 +20,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(SCRATCH_DIR, exist_ok=True)
 
 # Stream definition threshold (km²)
-THRESH_KM2 = 100.0
+THRESH_KM2 = 25.0
 
 # Outputs (use .tif so rasterio/other tools can read later)
 DEM_FILLED = os.path.join(OUT_DIR, "dem_filled.tif")

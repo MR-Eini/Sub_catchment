@@ -4,13 +4,13 @@ arcpy.CheckOutExtension("Spatial")
 arcpy.env.overwriteOutput = True
 
 BASE = r"E:\pythonProject\Europe\OUT_ARCGIS_90M"
-SSQ_IN = r"E:\pythonProject\Europe\SSQ.tif"
+SSQ_IN = r"Y:\MapStatistic\hydrology\discharge\MMQ.tif"
 
 SNAP = os.path.join(BASE, "streamlink.tif")   # 90m template
 OUT  = r"E:\pythonProject\Europe\DELTAQ_90M"
 os.makedirs(OUT, exist_ok=True)
 
-SSQ_3035 = os.path.join(OUT, "SSQ_90m_3035.tif")
+SSQ_3035 = os.path.join(OUT, "MMQ_90m_3035.tif")
 
 arcpy.env.snapRaster = SNAP
 arcpy.env.cellSize   = SNAP

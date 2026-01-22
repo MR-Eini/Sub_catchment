@@ -59,7 +59,7 @@ RIVER_BUFFER_CELLS = 1
 WBT_EXE = r"C:\Users\MRE\anaconda4\envs\Subcatchment\Library\bin\whitebox_tools.exe"
 assert os.path.exists(WBT_EXE), f"whitebox_tools.exe not found: {WBT_EXE}"
 
-THRESH_KM2 = 1000.0  # stream definition threshold
+THRESH_KM2 = 25.0  # stream definition threshold
 
 # Outputs / intermediates
 DEM_LAND     = os.path.join(OUT_DIR, "dem_land_only.tif")
