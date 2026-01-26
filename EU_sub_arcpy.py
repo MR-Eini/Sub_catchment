@@ -14,7 +14,7 @@ arcpy.env.overwriteOutput = True
 DEM_IN = r"E:\pythonProject\Europe\PREP_90M\dem_burned.tif"  # use burned DEM if you have it
 # DEM_IN = r"E:\pythonProject\Europe\PREP_90M\dem_90m_3035.tif"        # or original 90m
 
-OUT_DIR = r"E:\pythonProject\Europe\OUT_ARCGIS_90M"
+OUT_DIR = r"E:\pythonProject\Europe\OUT_ARCGIS_25M"
 SCRATCH_DIR = os.path.join(OUT_DIR, "_scratch")
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(SCRATCH_DIR, exist_ok=True)
